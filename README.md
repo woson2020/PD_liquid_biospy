@@ -2,7 +2,7 @@
 
 ## metilene_like.py 使用说明
 
-基于 metilene 的原理，我们提供了 `metilene_like.py`，用于从每个样本的 bedGraph CpG 甲基化文件中检测去 novo 差异甲基化区域（DMR）。
+基于 metilene 的原理，我们提供了 `metilene_like.py`，用于从每个样本的 bedGraph CpG 甲基化文件中检测去 novo 差异甲基化区域（DMR）。脚本引入覆盖度加权、递归二分分段及 Wald z 检验，力求与 metilene 保持一致。
 
 ### 依赖
 
@@ -15,7 +15,10 @@
 
 ### 输入数据
 
-1. **bedGraph 文件**：每个样本一个文件（至少包含 `chrom`, `start`, `end`, `beta` 四列）。`beta` 为 0~1 之间的甲基化比例。
+1. **bedGraph 文件**：每个样本一个文件（至少包含 `chrom`, `start`, `end`, `beta` 四列）。`beta` 为 0~1 之间的甲基化比例；若为 0~100 会自动换算。为得到 metilene 类似的结果，建议额外提供覆盖度列：
+   - 5 列格式：`chrom start end beta coverage`
+   - 6 列格式：`chrom start end beta methylated_count unmethylated_count`
+   缺失覆盖度时将退化为简单平均，不再使用覆盖度加权或 Wald 检验。
 2. **设计表（design.tsv）**：包含样本分组信息，支持 TSV 或 CSV。例如：
 
 ```
@@ -36,7 +39,8 @@ python metilene_like.py design.tsv \
   --min-cpgs 5 \
   --min-diff 0.2 \
   --max-gap 500 \
-  --max-qvalue 0.1
+  --max-qvalue 0.1 \
+  --require-coverage
 ```
 
 主要参数说明：
@@ -58,6 +62,9 @@ python metilene_like.py design.tsv \
 | mean_beta_group_a / mean_beta_group_b | 区域内两组样本平均甲基化水平（按样本均值） |
 | mean_diff / abs_diff | 组间甲基化水平差 |
 | direction | `hyper` 表示组 A 相对组 B 超甲基化，`hypo` 反之 |
+| segment_score | 递归分段时的加权得分（对应 metilene 的评分） |
+| total_cov_group_a / total_cov_group_b | 两组在该区域的覆盖度总和（无覆盖度时为 NaN） |
+| wald_z | 基于覆盖度的 Wald z 统计量（无覆盖度时为 NaN） |
 | mannwhitney_u | Mann-Whitney U 统计量 |
 | p_value / q_value | p 值与 BH 校正后的 q 值 |
 

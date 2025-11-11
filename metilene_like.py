@@ -11,8 +11,13 @@ consistent methylation differences, performs a Mann-Whitney U test for
 each region, and reports differentially methylated regions (DMRs) with
 Benjamini-Hochberg FDR correction.
 
-bedGraph expectation:
-    chrom   start   end     beta
+bedGraph expectation (per sample):
+    Required columns: chrom   start   end   beta
+    Optional columns (recommended for metilene parity):
+        - coverage  (total reads covering the CpG)
+        - meth_count and unmeth_count (or combined coverage inferred from them)
+
+If coverage columns are supplied（覆盖度信息）,统计检验和分段都会使用加权逻辑，更贴近 metilene。
 
 Sample sheet expectation (TSV/CSV with header):
     sample  group   path
@@ -28,11 +33,11 @@ import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.stats import mannwhitneyu
+from scipy.stats import mannwhitneyu, norm
 
 
 logging.basicConfig(
@@ -108,6 +113,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not raise an error if no regions pass the filters; write an empty file instead.",
     )
+    parser.add_argument(
+        "--require-coverage",
+        action="store_true",
+        help="Enforce presence of coverage columns in bedGraph files; error if缺失。",
+    )
     return parser.parse_args()
 
 
@@ -177,9 +187,15 @@ def group_samples(samples: Sequence[Sample], group_order: Sequence[str] | None =
     return ordered_groups[0], ordered_groups[1]
 
 
-def load_bedgraph_matrix(samples: Sequence[Sample], drop_na: bool) -> pd.DataFrame:
-    """加载所有样本的 bedGraph 数据并构建 CpG x Sample 的甲基化矩阵。"""
-    frames = []
+def load_bedgraph_tables(
+    samples: Sequence[Sample],
+    drop_na: bool,
+    require_coverage: bool,
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], bool]:
+    """加载所有样本的 bedGraph 数据并构建 CpG × Sample 的甲基化和覆盖度矩阵。"""
+    frames: List[pd.DataFrame] = []
+    coverage_available = True
+
     for sample in samples:
         LOGGER.info("Loading bedGraph for %s from %s", sample.name, sample.path)
         df = pd.read_csv(
@@ -187,23 +203,61 @@ def load_bedgraph_matrix(samples: Sequence[Sample], drop_na: bool) -> pd.DataFra
             sep="\t",
             comment="#",
             header=None,
-            usecols=[0, 1, 2, 3],
-            names=["chrom", "start", "end", "beta"],
-            dtype={"chrom": str, "start": np.int64, "end": np.int64, "beta": np.float64},
+            dtype={0: str, 1: np.int64, 2: np.int64},
         )
         if df.empty:
             LOGGER.warning("BedGraph for sample %s is empty.", sample.name)
             continue
-        frames.append(df.assign(sample=sample.name))
+
+        num_cols = df.shape[1]
+        if num_cols < 4:
+            raise ValueError(f"BedGraph for sample {sample.name} has fewer than 4 columns.")
+
+        base = df.iloc[:, :4].copy()
+        base.columns = ["chrom", "start", "end", "beta"]
+
+        if num_cols >= 6:
+            meth = pd.to_numeric(df.iloc[:, 4], errors="coerce")
+            unmeth = pd.to_numeric(df.iloc[:, 5], errors="coerce")
+            coverage = meth + unmeth
+        elif num_cols == 5:
+            coverage = pd.to_numeric(df.iloc[:, 4], errors="coerce")
+            meth = coverage * pd.to_numeric(base["beta"], errors="coerce")
+            unmeth = coverage - meth
+        else:
+            coverage = pd.Series(np.nan, index=base.index, dtype=np.float64)
+            meth = pd.Series(np.nan, index=base.index, dtype=np.float64)
+            unmeth = pd.Series(np.nan, index=base.index, dtype=np.float64)
+            coverage_available = False
+
+        base["coverage"] = coverage.astype(float)
+        base["meth_count"] = meth.astype(float)
+        base["unmeth_count"] = unmeth.astype(float)
+
+        beta = pd.to_numeric(base["beta"], errors="coerce")
+        try:
+            max_beta = np.nanmax(beta.to_numpy(dtype=float))
+        except ValueError:
+            max_beta = 0.0
+        needs_scaling = max_beta > 1.0
+        if needs_scaling:
+            beta = beta / 100.0
+        base["beta"] = beta
+
+        base["sample"] = sample.name
+        frames.append(base)
 
     if not frames:
         raise ValueError("No bedGraph data loaded; check sample sheet and file contents.")
+
+    if require_coverage and not coverage_available:
+        raise ValueError("Coverage columns were required but not found in all bedGraph files.")
 
     merged = pd.concat(frames, ignore_index=True)
     if merged.isnull().values.any():
         LOGGER.warning("NaN values detected in bedGraphs; they will be handled according to --drop-na.")
 
-    matrix = (
+    beta_matrix = (
         merged.pivot_table(
             index=["chrom", "start", "end"],
             columns="sample",
@@ -212,12 +266,27 @@ def load_bedgraph_matrix(samples: Sequence[Sample], drop_na: bool) -> pd.DataFra
         .sort_index()
     )
 
-    if drop_na:
-        before = len(matrix)
-        matrix = matrix.dropna(axis=0, how="any")
-        LOGGER.info("Dropped %d CpGs with missing values.", before - len(matrix))
+    coverage_matrix: Optional[pd.DataFrame]
+    if coverage_available:
+        coverage_matrix = (
+            merged.pivot_table(
+                index=["chrom", "start", "end"],
+                columns="sample",
+                values="coverage",
+            )
+            .sort_index()
+        )
+    else:
+        coverage_matrix = None
 
-    return matrix
+    if drop_na:
+        before = len(beta_matrix)
+        beta_matrix = beta_matrix.dropna(axis=0, how="any")
+        if coverage_matrix is not None:
+            coverage_matrix = coverage_matrix.loc[beta_matrix.index]
+        LOGGER.info("Dropped %d CpGs with missing values.", before - len(beta_matrix))
+
+    return beta_matrix, coverage_matrix, coverage_available
 
 
 def benjamini_hochberg(pvalues: Sequence[float]) -> np.ndarray:
@@ -243,123 +312,265 @@ def benjamini_hochberg(pvalues: Sequence[float]) -> np.ndarray:
 
 
 def segment_cpgs(
-    matrix: pd.DataFrame,
+    beta_matrix: pd.DataFrame,
+    coverage_matrix: Optional[pd.DataFrame],
     group_a: Sequence[str],
     group_b: Sequence[str],
     min_cpgs: int,
     min_diff: float,
     max_gap: int,
 ) -> List[Dict[str, object]]:
-    """根据甲基化差异对 CpG 进行分段，生成候选 DMR 区域并计算统计量。"""
-    diffs = matrix[group_a].mean(axis=1) - matrix[group_b].mean(axis=1)
-    index_tuples = list(matrix.index)
+    """根据甲基化差异对 CpG 进行递归二分分段，生成候选 DMR 区域并计算统计量。"""
 
+    def compute_group_stats(
+        beta_block: pd.DataFrame,
+        coverage_block: Optional[pd.DataFrame],
+        columns: Sequence[str],
+    ) -> Dict[str, object]:
+        if not columns:
+            return {
+                "per_sample_mean": np.array([], dtype=float),
+                "per_sample_cov": np.array([], dtype=float),
+                "total_cov": 0.0,
+                "total_meth": 0.0,
+                "mean": math.nan,
+            }
+
+        beta_subset = beta_block[columns]
+        if coverage_block is not None:
+            coverage_subset = coverage_block[columns].fillna(0.0)
+            beta_filled = beta_subset.fillna(0.0)
+            meth_per_sample = (beta_filled * coverage_subset).sum(axis=0, skipna=True).astype(float)
+            cov_per_sample = coverage_subset.sum(axis=0, skipna=True).astype(float)
+            per_sample_mean = np.divide(
+                meth_per_sample.to_numpy(),
+                cov_per_sample.to_numpy(),
+                out=np.full(cov_per_sample.shape, np.nan, dtype=float),
+                where=cov_per_sample.to_numpy() > 0,
+            )
+            total_cov = float(np.nansum(cov_per_sample.to_numpy()))
+            total_meth = float(np.nansum(meth_per_sample.to_numpy()))
+            mean_value = total_meth / total_cov if total_cov > 0 else math.nan
+            return {
+                "per_sample_mean": per_sample_mean,
+                "per_sample_cov": cov_per_sample.to_numpy(),
+                "total_cov": total_cov,
+                "total_meth": total_meth,
+                "mean": mean_value,
+            }
+
+        per_sample_mean_series = beta_subset.mean(axis=0, skipna=True)
+        per_sample_counts = beta_subset.notna().sum(axis=0).astype(float)
+        return {
+            "per_sample_mean": per_sample_mean_series.to_numpy(dtype=float),
+            "per_sample_cov": per_sample_counts.to_numpy(dtype=float),
+            "total_cov": math.nan,
+            "total_meth": math.nan,
+            "mean": float(per_sample_mean_series.mean(skipna=True)),
+        }
+
+    def weighted_group_mean(
+        beta_df: pd.DataFrame,
+        coverage_df: Optional[pd.DataFrame],
+        columns: Sequence[str],
+    ) -> Tuple[pd.Series, pd.Series]:
+        beta_subset = beta_df[columns]
+        if coverage_df is not None:
+            coverage_subset = coverage_df[columns].fillna(0.0)
+            weighted_sum = (beta_subset.fillna(0.0) * coverage_subset).sum(axis=1, min_count=1)
+            weight = coverage_subset.sum(axis=1, min_count=1)
+            mean_series = weighted_sum / weight
+        else:
+            mean_series = beta_subset.mean(axis=1, skipna=True)
+            weight = beta_subset.notna().sum(axis=1).astype(float)
+        return mean_series, weight
+
+    beta_group_a = [col for col in group_a if col in beta_matrix.columns]
+    beta_group_b = [col for col in group_b if col in beta_matrix.columns]
+
+    coverage_df_a = coverage_matrix[beta_group_a] if coverage_matrix is not None else None
+    coverage_df_b = coverage_matrix[beta_group_b] if coverage_matrix is not None else None
+
+    mean_a_series, weight_a_series = weighted_group_mean(beta_matrix, coverage_df_a, beta_group_a)
+    mean_b_series, weight_b_series = weighted_group_mean(beta_matrix, coverage_df_b, beta_group_b)
+
+    diff_series = mean_a_series - mean_b_series
+    weight_series = weight_a_series + weight_b_series
+
+    index_tuples = list(beta_matrix.index)
     regions: List[Dict[str, object]] = []
-    current: List[int] = []
-    current_sign: int | None = None
-    prev_chrom: str | None = None
-    prev_start: int | None = None
 
-    def flush():
-        """封装当前累计的 CpG 索引为区域，并计算差异及统计检验。"""
-        nonlocal current, current_sign, prev_chrom, prev_start
-        if len(current) >= min_cpgs:
-            group_a_means: np.ndarray | None = None
-            group_b_means: np.ndarray | None = None
-            u_stat = math.nan
-            p_value = math.nan
+    def binary_segment(block_indices: List[int]) -> List[Tuple[int, int, float]]:
+        if len(block_indices) < min_cpgs:
+            return []
+        diffs_block = diff_series.iloc[block_indices].to_numpy()
+        weights_block = weight_series.iloc[block_indices].to_numpy()
 
-            region_indices = [index_tuples[i] for i in current]
-            region_df = matrix.iloc[current]
+        prefix_w = np.concatenate(([0.0], np.cumsum(weights_block)))
+        prefix_s = np.concatenate(([0.0], np.cumsum(weights_block * diffs_block)))
 
-            valid_group_a = [col for col in group_a if not region_df[col].isna().all()]
-            valid_group_b = [col for col in group_b if not region_df[col].isna().all()]
+        results: List[Tuple[int, int, float]] = []
 
-            if not valid_group_a or not valid_group_b:
-                LOGGER.debug("Skipping region due to samples without coverage in one group.")
+        def recurse(left: int, right: int) -> None:
+            length = right - left
+            if length < min_cpgs:
+                return
+
+            best_span: Optional[Tuple[int, int]] = None
+            best_score = 0.0
+
+            for start in range(left, right - min_cpgs + 1):
+                min_end = start + min_cpgs
+                candidate_ends = np.arange(min_end, right + 1)
+                weights = prefix_w[candidate_ends] - prefix_w[start]
+                sums = prefix_s[candidate_ends] - prefix_s[start]
+
+                valid_mask = weights > 0
+                if not np.any(valid_mask):
+                    continue
+
+                weights = weights[valid_mask]
+                sums = sums[valid_mask]
+                candidate_ends = candidate_ends[valid_mask]
+
+                mean_diffs = sums / weights
+                diff_mask = np.abs(mean_diffs) >= min_diff
+                if not np.any(diff_mask):
+                    continue
+
+                weights = weights[diff_mask]
+                sums = sums[diff_mask]
+                candidate_ends = candidate_ends[diff_mask]
+
+                scores = np.abs(sums) / np.sqrt(weights)
+                local_idx = int(np.argmax(scores))
+                score = float(scores[local_idx])
+                if score > best_score:
+                    best_score = score
+                    best_span = (start, int(candidate_ends[local_idx]))
+
+            if best_span is None:
+                return
+
+            results.append((best_span[0], best_span[1], best_score))
+            recurse(left, best_span[0])
+            recurse(best_span[1], right)
+
+        recurse(0, len(block_indices))
+        return results
+
+    blocks: List[List[int]] = []
+    current_block: List[int] = []
+    prev_chrom: Optional[str] = None
+    prev_start: Optional[int] = None
+
+    for idx, (chrom, start, end) in enumerate(index_tuples):
+        diff_value = diff_series.iloc[idx]
+        weight_value = weight_series.iloc[idx]
+        if pd.isna(diff_value) or pd.isna(weight_value) or weight_value <= 0:
+            if current_block:
+                blocks.append(current_block)
+                current_block = []
+            prev_chrom = None
+            prev_start = None
+            continue
+
+        if current_block:
+            max_gap_exceeded = max_gap is not None and (chrom != prev_chrom or (start - prev_start) > max_gap)
+            if max_gap_exceeded:
+                blocks.append(current_block)
+                current_block = []
+
+        if not current_block:
+            prev_chrom = chrom
+
+        current_block.append(idx)
+        prev_start = start
+
+    if current_block:
+        blocks.append(current_block)
+
+    for block_indices in blocks:
+        segments = binary_segment(block_indices)
+        for local_start, local_end, score in segments:
+            global_indices = block_indices[local_start:local_end]
+            region_beta = beta_matrix.iloc[global_indices]
+            region_cov = coverage_matrix.iloc[global_indices] if coverage_matrix is not None else None
+
+            chr_name = index_tuples[global_indices[0]][0]
+            region_start = min(index_tuples[i][1] for i in global_indices)
+            region_end = max(index_tuples[i][2] for i in global_indices)
+
+            stats_a = compute_group_stats(region_beta, region_cov, beta_group_a)
+            stats_b = compute_group_stats(region_beta, region_cov, beta_group_b)
+
+            mean_a = stats_a["mean"]
+            mean_b = stats_b["mean"]
+            mean_diff = mean_a - mean_b if not (math.isnan(mean_a) or math.isnan(mean_b)) else math.nan
+            abs_diff = abs(mean_diff) if not math.isnan(mean_diff) else math.nan
+            if math.isnan(mean_diff):
+                direction = "undetermined"
             else:
-                group_a_means = region_df[valid_group_a].mean(axis=0, skipna=True).to_numpy(dtype=float)
-                group_b_means = region_df[valid_group_b].mean(axis=0, skipna=True).to_numpy(dtype=float)
+                direction = "hyper" if mean_diff > 0 else "hypo"
 
-                group_a_means = group_a_means[~np.isnan(group_a_means)]
-                group_b_means = group_b_means[~np.isnan(group_b_means)]
+            wald_z = math.nan
+            p_value = math.nan
+            u_stat = math.nan
 
-                if len(group_a_means) == 0 or len(group_b_means) == 0:
-                    LOGGER.debug("Skipping region with insufficient per-sample means after NaN filtering.")
-                    group_a_means = group_b_means = None
-                else:
+            if (
+                coverage_matrix is not None
+                and stats_a["total_cov"] > 0
+                and stats_b["total_cov"] > 0
+            ):
+                p1 = stats_a["total_meth"] / stats_a["total_cov"]
+                p2 = stats_b["total_meth"] / stats_b["total_cov"]
+                pooled_cov = stats_a["total_cov"] + stats_b["total_cov"]
+                pooled_meth = stats_a["total_meth"] + stats_b["total_meth"]
+                pooled = pooled_meth / pooled_cov if pooled_cov > 0 else math.nan
+                variance = pooled * (1.0 - pooled) * (1.0 / stats_a["total_cov"] + 1.0 / stats_b["total_cov"])
+                if variance > 0 and not math.isnan(variance):
+                    wald_z = (p1 - p2) / math.sqrt(variance)
+                    p_value = 2 * norm.sf(abs(wald_z))
+
+            if math.isnan(p_value):
+                group_a_vals = stats_a["per_sample_mean"]
+                group_b_vals = stats_b["per_sample_mean"]
+                group_a_vals = group_a_vals[~np.isnan(group_a_vals)]
+                group_b_vals = group_b_vals[~np.isnan(group_b_vals)]
+                if len(group_a_vals) > 0 and len(group_b_vals) > 0:
                     try:
-                        u_stat, p_value = mannwhitneyu(group_a_means, group_b_means, alternative="two-sided")
+                        u_stat, p_value = mannwhitneyu(group_a_vals, group_b_vals, alternative="two-sided")
                     except ValueError as exc:
                         LOGGER.debug(
                             "Mann-Whitney failed for region %s:%d-%d: %s",
-                            region_indices[0][0],
-                            region_indices[0][1],
-                            region_indices[-1][2],
+                            chr_name,
+                            region_start,
+                            region_end,
                             exc,
                         )
                         p_value = math.nan
                         u_stat = math.nan
 
-            if group_a_means is not None:
-                chrom = region_indices[0][0]
-                start = min(idx[1] for idx in region_indices)
-                end = max(idx[2] for idx in region_indices)
-                mean_a = float(np.mean(group_a_means))
-                mean_b = float(np.mean(group_b_means))
-                mean_diff = mean_a - mean_b
-                abs_diff = abs(mean_diff)
-                direction = "hyper" if mean_diff > 0 else "hypo"
+            regions.append(
+                {
+                    "chrom": chr_name,
+                    "start": int(region_start),
+                    "end": int(region_end),
+                    "num_cpgs": len(global_indices),
+                    "mean_beta_group_a": float(mean_a),
+                    "mean_beta_group_b": float(mean_b),
+                    "mean_diff": float(mean_diff),
+                    "abs_diff": float(abs_diff),
+                    "direction": direction,
+                    "segment_score": float(score),
+                    "total_cov_group_a": float(stats_a["total_cov"]),
+                    "total_cov_group_b": float(stats_b["total_cov"]),
+                    "wald_z": float(wald_z),
+                    "mannwhitney_u": float(u_stat),
+                    "p_value": float(p_value),
+                }
+            )
 
-                regions.append(
-                    {
-                        "chrom": chrom,
-                        "start": int(start),
-                        "end": int(end),
-                        "num_cpgs": len(current),
-                        "mean_beta_group_a": mean_a,
-                        "mean_beta_group_b": mean_b,
-                        "mean_diff": mean_diff,
-                        "abs_diff": abs_diff,
-                        "direction": direction,
-                        "mannwhitney_u": u_stat,
-                        "p_value": p_value,
-                    }
-                )
-        current = []
-        current_sign = None
-        prev_chrom = None
-        prev_start = None
-
-    for idx, diff in enumerate(diffs):
-        chrom, start, end = index_tuples[idx]
-        if pd.isna(diff) or abs(diff) < min_diff:
-            flush()
-            continue
-
-        sign = 1 if diff > 0 else -1
-        is_contiguous = (
-            current
-            and prev_chrom == chrom
-            and prev_start is not None
-            and (start - prev_start) <= max_gap
-            and sign == current_sign
-        )
-
-        if not current or is_contiguous:
-            if not current:
-                current_sign = sign
-            current.append(idx)
-            prev_chrom = chrom
-            prev_start = start
-        else:
-            flush()
-            current.append(idx)
-            current_sign = sign
-            prev_chrom = chrom
-            prev_start = start
-
-    flush()
     LOGGER.info("Identified %d candidate regions before statistical filtering.", len(regions))
     return regions
 
@@ -378,18 +589,30 @@ def main() -> None:
         len(group_b_samples),
     )
 
-    matrix = load_bedgraph_matrix(samples, drop_na=args.drop_na)
-    if matrix.empty:
+    beta_matrix, coverage_matrix, coverage_available = load_bedgraph_tables(
+        samples=samples,
+        drop_na=args.drop_na,
+        require_coverage=args.require_coverage,
+    )
+    if beta_matrix.empty:
         raise ValueError("Combined methylation matrix is empty after preprocessing.")
 
-    group_a_names = [sample.name for sample in group_a_samples if sample.name in matrix.columns]
-    group_b_names = [sample.name for sample in group_b_samples if sample.name in matrix.columns]
+    if coverage_matrix is not None:
+        LOGGER.info("Coverage-aware weighting enabled for segmentation and statistical testing.")
+    else:
+        LOGGER.warning(
+            "No coverage columns detected; falling back to unweighted averages and Mann-Whitney tests."
+        )
+
+    group_a_names = [sample.name for sample in group_a_samples if sample.name in beta_matrix.columns]
+    group_b_names = [sample.name for sample in group_b_samples if sample.name in beta_matrix.columns]
 
     if not group_a_names or not group_b_names:
         raise ValueError("Samples missing from combined matrix; verify bedGraph loading.")
 
     regions = segment_cpgs(
-        matrix=matrix,
+        beta_matrix=beta_matrix,
+        coverage_matrix=coverage_matrix,
         group_a=group_a_names,
         group_b=group_b_names,
         min_cpgs=args.min_cpgs,
