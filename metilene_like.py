@@ -44,7 +44,7 @@ LOGGER = logging.getLogger("metilene_like")
 
 @dataclass(frozen=True)
 class Sample:
-    """Container for a single sample description."""
+    """单一样本的描述信息容器，包含名称、分组和bedGraph路径。"""
 
     name: str
     group: str
@@ -52,6 +52,7 @@ class Sample:
 
 
 def parse_args() -> argparse.Namespace:
+    """解析命令行参数并返回包含所有选项的 Namespace 对象。"""
     parser = argparse.ArgumentParser(
         description="Approximate metilene-style de novo DMR detection from bedGraph files."
     )
@@ -111,6 +112,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_design_sheet(path: Path) -> List[Sample]:
+    """读取设计表，解析样本信息并返回 Sample 对象列表。"""
     if not path.exists():
         raise FileNotFoundError(f"Sample sheet {path} does not exist.")
 
@@ -147,6 +149,7 @@ def read_design_sheet(path: Path) -> List[Sample]:
 
 
 def _lookup_column(column_map: Dict[str, str], candidates: Iterable[str]) -> str:
+    """在列名映射中查找候选列，找到则返回原始列名。"""
     for candidate in candidates:
         if candidate in column_map:
             return column_map[candidate]
@@ -154,6 +157,7 @@ def _lookup_column(column_map: Dict[str, str], candidates: Iterable[str]) -> str
 
 
 def group_samples(samples: Sequence[Sample], group_order: Sequence[str] | None = None) -> Tuple[List[Sample], List[Sample]]:
+    """按照分组信息将样本划分为两组，可选指定组顺序。"""
     groups: Dict[str, List[Sample]] = {}
     for sample in samples:
         groups.setdefault(sample.group, []).append(sample)
@@ -174,6 +178,7 @@ def group_samples(samples: Sequence[Sample], group_order: Sequence[str] | None =
 
 
 def load_bedgraph_matrix(samples: Sequence[Sample], drop_na: bool) -> pd.DataFrame:
+    """加载所有样本的 bedGraph 数据并构建 CpG x Sample 的甲基化矩阵。"""
     frames = []
     for sample in samples:
         LOGGER.info("Loading bedGraph for %s from %s", sample.name, sample.path)
@@ -216,6 +221,7 @@ def load_bedgraph_matrix(samples: Sequence[Sample], drop_na: bool) -> pd.DataFra
 
 
 def benjamini_hochberg(pvalues: Sequence[float]) -> np.ndarray:
+    """对 p 值序列执行 Benjamini-Hochberg 多重检验校正，返回 q 值数组。"""
     pvals = np.asarray(pvalues, dtype=float)
     n = pvals.size
     if n == 0:
@@ -244,6 +250,7 @@ def segment_cpgs(
     min_diff: float,
     max_gap: int,
 ) -> List[Dict[str, object]]:
+    """根据甲基化差异对 CpG 进行分段，生成候选 DMR 区域并计算统计量。"""
     diffs = matrix[group_a].mean(axis=1) - matrix[group_b].mean(axis=1)
     index_tuples = list(matrix.index)
 
@@ -254,6 +261,7 @@ def segment_cpgs(
     prev_start: int | None = None
 
     def flush():
+        """封装当前累计的 CpG 索引为区域，并计算差异及统计检验。"""
         nonlocal current, current_sign, prev_chrom, prev_start
         if len(current) >= min_cpgs:
             group_a_means: np.ndarray | None = None
@@ -357,6 +365,7 @@ def segment_cpgs(
 
 
 def main() -> None:
+    """主入口：解析参数、加载数据、执行分段检测并输出结果。"""
     args = parse_args()
 
     samples = read_design_sheet(args.design)
