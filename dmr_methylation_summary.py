@@ -197,21 +197,17 @@ def load_bedgraph(sample: SampleInfo) -> SampleBedGraph:
 def summarize_dmrs(
     dmrs: pd.DataFrame,
     dmrs_id: pd.Series,
-    samples: List[SampleInfo],
+    sample_names: List[str],
+    bedgraphs: Dict[str, SampleBedGraph],
     add_coverage: bool,
 ) -> pd.DataFrame:
+    """计算 DMR 覆盖度加权甲基化水平（核心函数，可在 notebook 中直接调用）。"""
+    n_dmrs = len(dmrs)
     summary: Dict[str, np.ndarray] = {}
     coverage_summary: Dict[str, np.ndarray] = {}
 
-    cached_bedgraphs: Dict[str, SampleBedGraph] = {}
-
-    for sample in samples:
-        bedgraph = load_bedgraph(sample)
-        cached_bedgraphs[sample.name] = bedgraph
-
-    n_dmrs = len(dmrs)
-    for sample in samples:
-        bedgraph = cached_bedgraphs[sample.name]
+    for sample_name in sample_names:
+        bedgraph = bedgraphs[sample_name]
         meth_array = np.zeros(n_dmrs, dtype=np.float64)
         cov_array = np.zeros(n_dmrs, dtype=np.float64)
 
@@ -227,9 +223,9 @@ def summarize_dmrs(
             else:
                 meth_array[idx] = np.nan
 
-        summary[sample.name] = meth_array
+        summary[sample_name] = meth_array
         if add_coverage:
-            coverage_summary[f"{sample.name}_coverage"] = cov_array
+            coverage_summary[f"{sample_name}_coverage"] = cov_array
 
     result = pd.DataFrame(
         {
@@ -240,12 +236,65 @@ def summarize_dmrs(
         }
     )
 
-    for sample in samples:
-        result[sample.name] = summary[sample.name]
+    for sample_name in sample_names:
+        result[sample_name] = summary[sample_name]
         if add_coverage:
-            result[f"{sample.name}_coverage"] = coverage_summary[f"{sample.name}_coverage"]
+            result[f"{sample_name}_coverage"] = coverage_summary[f"{sample_name}_coverage"]
 
     return result
+
+
+def compute_dmr_methylation_matrix(
+    dmrs: pd.DataFrame,
+    sample_paths: Dict[str, Path | str],
+    *,
+    chrom_column: str = "chrom",
+    start_column: str = "start",
+    end_column: str = "end",
+    dmr_id_column: Optional[str] = None,
+    add_coverage: bool = False,
+) -> pd.DataFrame:
+    """Notebook 友好的封装：给定 DataFrame 与样本路径映射，返回 DMR × 样本甲基化矩阵。"""
+    required_cols = {chrom_column, start_column, end_column}
+    missing_cols = required_cols - set(dmrs.columns)
+    if missing_cols:
+        raise KeyError(f"DMR table missing required columns: {', '.join(sorted(missing_cols))}")
+
+    dmrs_proc = dmrs.rename(
+        columns={
+            chrom_column: "chrom",
+            start_column: "start",
+            end_column: "end",
+        }
+    ).copy()
+    dmrs_proc[["start", "end"]] = dmrs_proc[["start", "end"]].astype(np.int64)
+
+    if dmr_id_column:
+        if dmr_id_column not in dmrs.columns:
+            raise KeyError(f"DMR ID column '{dmr_id_column}' not present in provided DataFrame.")
+        dmr_id = dmrs[dmr_id_column].astype(str)
+    else:
+        dmr_id = dmrs_proc.index.map(lambda i: f"DMR_{i+1}")
+
+    sample_infos: List[SampleInfo] = []
+    for name, path in sample_paths.items():
+        resolved = Path(path)
+        if not resolved.is_absolute():
+            resolved = resolved.resolve()
+        if not resolved.exists():
+            raise FileNotFoundError(f"BedGraph for sample '{name}' not found: {resolved}")
+        sample_infos.append(SampleInfo(name=str(name), path=resolved))
+
+    sample_names = [info.name for info in sample_infos]
+    bedgraphs = {info.name: load_bedgraph(info) for info in sample_infos}
+
+    return summarize_dmrs(
+        dmrs=dmrs_proc[["chrom", "start", "end"]],
+        dmrs_id=dmr_id,
+        sample_names=sample_names,
+        bedgraphs=bedgraphs,
+        add_coverage=add_coverage,
+    )
 
 
 def main() -> None:
@@ -274,11 +323,14 @@ def main() -> None:
         dmr_id = dmrs.index.map(lambda i: f"DMR_{i+1}")
 
     samples = read_design(args.design)
+    sample_names = [sample.name for sample in samples]
+    bedgraphs = {sample.name: load_bedgraph(sample) for sample in samples}
 
     summary_df = summarize_dmrs(
         dmrs=dmrs[["chrom", "start", "end"]],
         dmrs_id=dmr_id,
-        samples=samples,
+        sample_names=sample_names,
+        bedgraphs=bedgraphs,
         add_coverage=args.add_coverage,
     )
 

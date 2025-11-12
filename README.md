@@ -105,3 +105,29 @@ TSV 文件包含以下列：
 | `<sample>_coverage` | （可选）该样本在此 DMR 的覆盖度总和，需 `--add-coverage` |
 
 若某个样本在 DMR 中 coverage 总和为 0，则对应甲基化水平为 `NaN`。可直接将输出用于后续绘图或差异可视化。
+
+### Notebook 调用示例
+
+脚本同时提供无需命令行的函数接口，可直接在 Jupyter 中使用：
+
+```python
+from pathlib import Path
+import pandas as pd
+from dmr_methylation_summary import compute_dmr_methylation_matrix
+
+dmr_df = pd.read_csv("dmrs.tsv", sep="\t")
+sample_paths = {
+    "sample01": Path("data/sample01.bedgraph"),
+    "sample02": Path("data/sample02.bedgraph"),
+}
+
+matrix = compute_dmr_methylation_matrix(
+    dmr_df,
+    sample_paths,
+    dmr_id_column="id",  # 若 DMR 表有 ID 列
+    add_coverage=True,
+)
+matrix.head()
+```
+
+生成的 `matrix` 即为 DMR × 样本的加权甲基化矩阵。
