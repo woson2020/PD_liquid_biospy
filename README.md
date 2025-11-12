@@ -69,3 +69,39 @@ python metilene_like.py design.tsv \
 | p_value / q_value | p 值与 BH 校正后的 q 值 |
 
 若没有区域满足阈值，可添加 `--allow-empty-output` 以输出空文件并避免报错。
+
+## dmr_methylation_summary.py 使用说明
+
+给定 metilene 等工具输出的 DMR 列表以及各样本的 CpG bedGraph（含 coverage 与 meth_read），`dmr_methylation_summary.py` 用覆盖度加权方式计算每个 DMR 在每个样本中的平均甲基化水平。
+
+### 额外依赖
+
+- 与前述脚本相同的 Python 环境即可（numpy / pandas）。
+
+### 输入
+
+1. **DMR 文件**：至少包含 `chrom`, `start`, `end` 列，`start/end` 推荐使用 0-based 坐标。可通过 `--chrom-column` 等参数调整列名；若有 ID 列，可用 `--dmr-id-column` 指定。
+2. **设计表 design.tsv**：列示样本名称和对应 bedGraph 路径，与 `metilene_like.py` 的设计表相同格式。
+3. **bedGraph**：必须包含 `chrom start end coverage meth_read` 五列（无表头）。覆盖度为总 reads，`meth_read` 为甲基化 reads。
+
+### 使用示例
+
+```
+python dmr_methylation_summary.py dmrs.tsv design.tsv \
+  --output dmr_beta.tsv \
+  --dmr-id-column id \
+  --add-coverage
+```
+
+### 输出
+
+TSV 文件包含以下列：
+
+| 列名 | 含义 |
+| ---- | ---- |
+| dmr_id | DMR 标识（若未提供则为 `DMR_#`） |
+| chrom / start / end | DMR 坐标 |
+| `<sample>` | 对应样本的覆盖度加权甲基化水平（meth / coverage） |
+| `<sample>_coverage` | （可选）该样本在此 DMR 的覆盖度总和，需 `--add-coverage` |
+
+若某个样本在 DMR 中 coverage 总和为 0，则对应甲基化水平为 `NaN`。可直接将输出用于后续绘图或差异可视化。
