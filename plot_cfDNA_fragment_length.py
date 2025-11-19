@@ -1,45 +1,49 @@
 #!/usr/bin/env python3
 """
-Minimal script for plotting cfDNA fragment length distribution in Jupyter.
-Replace `bam_path` with your BAM location and run the file (e.g. `%run plot_cfDNA_fragment_length.py`).
+超直观版本：只需要把 bam_path 改成自己的 BAM 文件，直接在 Jupyter 里 `%run plot_cfDNA_fragment_length.py` 就能画出片段长度分布。
 """
 
-from collections import Counter
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import pandas as pd
 import pysam
 from tqdm import tqdm
 
+# 1. 把这里改成你的 BAM 路径，例如 Path("/data/sample.bam")
+bam_path = Path("xxx")
 
-# === User-configurable section ===
-bam_path = Path("xxx")  # TODO: replace with the real BAM path
-min_length = 0          # optional lower bound for fragment length (bp)
-max_length = None       # optional upper bound; set to an integer or keep None
-bin_width = 5           # bin width for the histogram-style bar plot
-require_same_start = True  # enforce read1/read2 map to same reference/start
+# 2. 是否要求 read1/read2 完全从同一位置开始（一般 cfDNA 需要）
+require_same_start = True
+
+# 3. 只看特定长度区间，可按需调节
+min_length = 0
+max_length = 600  # 如果不想限制，改成 None
+
+# 4. 如果 BAM 很大，可以打开进度条方便观察
 show_progress = True
-# ===============================
 
-
+# --- 以下代码保持不动即可 ---
 if not bam_path.exists():
-    raise FileNotFoundError(f"BAM file not found: {bam_path}")
+    raise FileNotFoundError(f"找不到 BAM 文件：{bam_path}")
 
-counter = Counter()
+fragment_lengths = []
 
 with pysam.AlignmentFile(bam_path, "rb") as bam:
     iterator = bam.fetch(until_eof=True)
     if show_progress:
-        iterator = tqdm(iterator, desc="Scanning reads")
+        iterator = tqdm(iterator, desc="扫描 BAM", unit="read")
 
     for read in iterator:
+        # 只检查 read1，避免重复计算
         if not read.is_paired or not read.is_read1:
             continue
+        # R1 或 R2 没有比对成功就跳过
         if read.is_unmapped or read.mate_is_unmapped:
             continue
+        # 去掉次要/补充/重复的比对
         if read.is_secondary or read.is_supplementary or read.is_duplicate:
             continue
+        # 不是 proper pair 的不要
         if not read.is_proper_pair:
             continue
 
@@ -57,29 +61,16 @@ with pysam.AlignmentFile(bam_path, "rb") as bam:
         if max_length is not None and frag_len > max_length:
             continue
 
-        counter[frag_len] += 1
+        fragment_lengths.append(frag_len)
 
-distribution = (
-    pd.Series(counter, name="count")
-    .rename_axis("fragment_length")
-    .sort_index()
-    .reset_index()
-)
-distribution["fraction"] = distribution["count"] / distribution["count"].sum()
+if not fragment_lengths:
+    raise RuntimeError("没有找到符合条件的片段，请检查 BAM 或过滤条件。")
 
-# Plot
 plt.style.use("seaborn-v0_8-whitegrid")
-fig, ax = plt.subplots(figsize=(9, 4))
-
-binned = (
-    distribution.assign(bin=lambda df: (df["fragment_length"] // bin_width) * bin_width)
-    .groupby("bin", as_index=False)["fraction"]
-    .sum()
-)
-
-ax.bar(binned["bin"], binned["fraction"], width=bin_width * 0.9, color="#1f77b4")
-ax.set_xlabel("Fragment length (bp)")
-ax.set_ylabel("Fraction of read pairs")
-ax.set_title("cfDNA fragment length distribution")
-ax.set_xlim(left=0)
+plt.figure(figsize=(10, 4))
+plt.hist(fragment_lengths, bins=range(0, max(fragment_lengths) + 5, 5), color="#1f77b4")
+plt.xlabel("Fragment length (bp)")
+plt.ylabel("Read count")
+plt.title("cfDNA fragment length distribution")
+plt.xlim(left=0)
 plt.show()
