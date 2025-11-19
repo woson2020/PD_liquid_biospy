@@ -6,6 +6,7 @@
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import pandas as pd
 import pysam
 from tqdm import tqdm
 
@@ -21,6 +22,9 @@ max_length = 600  # 如果不想限制，改成 None
 
 # 4. 如果 BAM 很大，可以打开进度条方便观察
 show_progress = True
+
+# 5. 折线图平滑窗口（单位：bp），设置成 1 则不平滑
+smooth_window = 5
 
 # --- 以下代码保持不动即可 ---
 if not bam_path.exists():
@@ -66,11 +70,35 @@ with pysam.AlignmentFile(bam_path, "rb") as bam:
 if not fragment_lengths:
     raise RuntimeError("没有找到符合条件的片段，请检查 BAM 或过滤条件。")
 
+counts = (
+    pd.Series(fragment_lengths, name="fragment_length")
+    .value_counts()
+    .sort_index()
+    .rename_axis("fragment_length")
+    .rename("count")
+    .reset_index()
+)
+counts["percent"] = counts["count"] / counts["count"].sum() * 100
+
+if smooth_window > 1:
+    counts["percent_smoothed"] = (
+        counts["percent"]
+        .rolling(window=smooth_window, min_periods=1, center=True)
+        .mean()
+    )
+else:
+    counts["percent_smoothed"] = counts["percent"]
+
 plt.style.use("seaborn-v0_8-whitegrid")
 plt.figure(figsize=(10, 4))
-plt.hist(fragment_lengths, bins=range(0, max(fragment_lengths) + 5, 5), color="#1f77b4")
+plt.plot(
+    counts["fragment_length"],
+    counts["percent_smoothed"],
+    color="#1f77b4",
+    linewidth=2,
+)
 plt.xlabel("Fragment length (bp)")
-plt.ylabel("Read count")
-plt.title("cfDNA fragment length distribution")
+plt.ylabel("Percentage of read pairs (%)")
+plt.title("cfDNA fragment length distribution (smoothed line)")
 plt.xlim(left=0)
 plt.show()
